@@ -74,7 +74,6 @@ class StableLmConfig(ConfigBase):  # pylint: disable=too-many-instance-attribute
                 bold("context_window_size"),
             )
             self.prefill_chunk_size = self.context_window_size
-        assert self.tensor_parallel_shards == 1, "StableLM currently does not support sharding."
 
 
 # pylint: disable=invalid-name,missing-docstring
