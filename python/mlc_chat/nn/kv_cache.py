@@ -62,23 +62,19 @@ class PagedKVCache(Object):  # pylint: disable=too-few-public-methods
         if rotary_dim is None:
             rotary_dim = head_dim
         return PagedKVCache(
-            _expr=rx.Call(
-                rx.extern("mlc.create_paged_kv_cache_generic"),
-                args=[
-                    rx.ShapeExpr(
-                        [max_batch_size, max_total_seq_len, prefill_chunk_size, page_size]
-                    ),
-                    rx.PrimValue(num_hidden_layers),
-                    rx.PrimValue(num_attention_heads),
-                    rx.PrimValue(num_key_value_heads),
-                    rx.PrimValue(head_dim),
-                    rx.PrimValue(rope_mode),
-                    rx.PrimValue(rope_scale),
-                    rx.PrimValue(rope_theta),
-                    rx.PrimValue(rotary_dim),
-                    rx.DataTypeImm(dtype),
-                ],
-                sinfo_args=[rx.ObjectStructInfo()],
+            _expr=rx.call_pure_packed(
+                "mlc.create_paged_kv_cache_generic",
+                rx.ShapeExpr([max_batch_size, max_total_seq_len, prefill_chunk_size, page_size]),
+                rx.PrimValue(num_hidden_layers),
+                rx.PrimValue(num_attention_heads),
+                rx.PrimValue(num_key_value_heads),
+                rx.PrimValue(head_dim),
+                rx.PrimValue(rope_mode),
+                rx.PrimValue(rope_scale),
+                rx.PrimValue(rope_theta),
+                rx.PrimValue(rotary_dim),
+                rx.DataTypeImm(dtype),
+                sinfo_args=rx.ObjectStructInfo(),
             ),
             _name=name,
         )
@@ -259,15 +255,15 @@ class FlashInferPagedKVCache(PagedKVCache):  # pylint: disable=too-few-public-me
             # pylint: disable=line-too-long
             # fmt: off
             bb.add_func(_kv_cache_transpose_append(num_key_value_heads, head_dim, dtype), "kv_cache_transpose_append"),
-            rx.extern("paged_kv_cache.attention_kernel_prefill"),
-            rx.extern("paged_kv_cache.attention_kernel_decode"),
+            rx.extern("flashinfer.attention_kernel_prefill_with_paged_kv_cache"),
+            rx.extern("flashinfer.attention_kernel_decode_with_paged_kv_cache"),
             rx.extern("flashinfer.attention_kernel_prefill_with_ragged_kv_cache"),
             rx.extern("flashinfer.attention_kernel_prefill_with_ragged_kv_cache_begin_forward"),
             rx.extern("flashinfer.attention_kernel_prefill_with_ragged_kv_cache_end_forward"),
-            rx.extern("paged_kv_cache.attention_kernel_prefill_begin_forward"),
-            rx.extern("paged_kv_cache.attention_kernel_prefill_end_forward"),
-            rx.extern("paged_kv_cache.attention_kernel_decode_begin_forward"),
-            rx.extern("paged_kv_cache.attention_kernel_decode_end_forward"),
+            rx.extern("flashinfer.attention_kernel_prefill_with_paged_kv_cache_begin_forward"),
+            rx.extern("flashinfer.attention_kernel_prefill_with_paged_kv_cache_end_forward"),
+            rx.extern("flashinfer.attention_kernel_decode_with_paged_kv_cache_begin_forward"),
+            rx.extern("flashinfer.attention_kernel_decode_with_paged_kv_cache_end_forward"),
             rx.extern("flashinfer.merge_state_in_place"),
             bb.add_func(llama_rope_with_position_map(rope_theta, rope_scale, head_dim, num_attention_heads, num_key_value_heads, dtype, rotary_dim), "tir_split_rotary"),
             bb.add_func(llama_inplace_rope(rope_theta, rope_scale, head_dim, num_attention_heads, num_key_value_heads, dtype, target, rotary_dim), "tir_qk_rotary_inplace"),
@@ -835,8 +831,13 @@ def _attention_decode(
     H_kv = num_kv_heads
     D = head_dim
 
+    THREAD_LIMIT = 512
+    TILE_SIZE_PER_BDX = 2
+    if target.kind.name == "opencl" and "android" in str(target.host):
+        THREAD_LIMIT = 64
+        TILE_SIZE_PER_BDX = 1
     max_num_threads_per_block = get_max_num_threads_per_block(target)
-    thread_limit = min(max_num_threads_per_block, 512)
+    thread_limit = min(max_num_threads_per_block, THREAD_LIMIT)
 
     GROUP_SIZE = H_qo // H_kv
     VEC_SIZE = min(max(8 // qkv_dtype_bytes, D // 32), 4)
@@ -847,7 +848,7 @@ def _attention_decode(
     gdz = GROUP_SIZE // bdy
     threads_per_CTA = max(thread_limit, bdx * bdy)
     bdz = threads_per_CTA // (bdx * bdy)
-    tile_size_per_bdx = 2 if GROUP_SIZE == 1 else 1
+    tile_size_per_bdx = TILE_SIZE_PER_BDX if GROUP_SIZE == 1 else 1
     log2e = math.log2(math.exp(1))
     check_thread_limits(target, bdx=bdx, bdy=bdy, bdz=bdz, gdz=1)
 
@@ -994,10 +995,9 @@ def _attention_decode(
                                             )
                                             T.tvm_thread_allreduce(T.uint32(1), S_reduce_local[0], True, t0[0], tx, dtype="handle")
 
+                                        S_local[j] = -5e4
                                         if (iterator * bdz + tz) * bdy * tile_size_per_bdx + j < kv_chunk_len[0]:
                                             S_local[j] = t0[0]
-                                        else:
-                                            S_local[j] = -5e4
                                         # update st_m
                                         st_m[0] = T.max(st_m[0], S_local[j])
 
