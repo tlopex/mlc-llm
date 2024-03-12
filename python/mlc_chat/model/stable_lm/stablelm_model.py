@@ -171,7 +171,6 @@ class StableLmForCausalLM(nn.Module):  # pylint: disable=too-many-instance-attri
         self.vocab_size = config.vocab_size
         self.rope_theta = config.rope_theta
         self.tensor_parallel_shards = config.tensor_parallel_shards
-        self.dtype = "float32"
         self.partial_rotary_factor = config.partial_rotary_factor
 
     def to(self, dtype: Optional[str] = None):
