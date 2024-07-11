@@ -184,7 +184,7 @@ class Starcoder2ForCausalLM(nn.Module):  # pylint: disable=too-many-instance-att
         self.num_attention_heads = config.num_attention_heads
         self.head_dim = config.head_dim
         self.vocab_size = config.vocab_size
-        self.rope_theta = 10000
+        self.rope_theta = config.rope_theta
         self.tensor_parallel_shards = config.tensor_parallel_shards
         self.dtype = "float32"
 
