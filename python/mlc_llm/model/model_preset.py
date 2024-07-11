@@ -1056,7 +1056,7 @@ MODEL_PRESETS: Dict[str, Any] = {
         "num_attention_heads": 36,
         "num_hidden_layers": 32,
         "num_key_value_heads": 4,
-        "rope_theta": 1000000, #wtf? here
+        "rope_theta": 1000000,
         "scale_attention_softmax_in_fp32": True,
         "scale_attn_weights": True,
         "sliding_window": 4096,
