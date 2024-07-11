@@ -90,14 +90,17 @@ class Starcoder2Attention(nn.Module):  # pylint: disable=too-many-instance-attri
                 f"Cannot split {config.num_attention_heads} attention heads "
                 f"evenly to {config.tensor_parallel_shards} GPUs."
             )
+        
         self.num_heads = config.num_attention_heads // config.tensor_parallel_shards
         self.head_dim = config.head_dim
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.context_window_size
 
         self.wqkv_pack = nn.Linear(
-            self.hidden_size, 3 * self.num_heads * self.head_dim, bias=config.bias
+            self.hidden_size, 3 * self.num_heads * self.head_dim, bias=True
         )
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
     def forward(self, hidden_states: Tensor, paged_kv_cache: PagedKVCache, layer_id: int):
         d, h = self.head_dim, self.num_heads
@@ -119,70 +122,40 @@ class Starcoder2MLP(nn.Module):
                 f"evenly to {config.tensor_parallel_shards} GPUs."
             )
         self.intermediate_size = config.intermediate_size // config.tensor_parallel_shards
+        embed_dim = config.hidden_size
 
-        self.gate_up_proj = nn.Linear(
-            in_features=config.hidden_size,
-            out_features=2 * self.intermediate_size,
-            bias=False,
+        self.c_fc = nn.Linear(
+            in_features=embed_dim,
+            out_features=self.intermediate_size,
+            bias=config.use_bias,
         )
-        self.down_proj = nn.Linear(self.intermediate_size, config.hidden_size, bias=False)
+        self.c_proj = nn.Linear(self.intermediate_size, embed_dim, bias=config.use_bias)
 
-    def forward(self, x):
-        concat_x1_x2 = self.gate_up_proj(x)
-        x1, x2 = op.split(concat_x1_x2, 2, axis=-1)
-        return self.down_proj(op.silu(x1) * x2)
+    def forward(self, hidden_states: Tensor):
+        hidden_states = self.c_fc(hidden_states)
+        hidden_states = op.gelu(hidden_states, approximate="tanh")
+        hidden_states = self.c_proj(hidden_states)
+        return hidden_states
 
 
 class Starcoder2DecoderLayer(nn.Module):
     def __init__(self, config: Starcoder2Config):
+        self.hidden_size = config.hidden_size
         self.self_attn = Starcoder2Attention(config)
         self.mlp = Starcoder2MLP(config)
-        self.input_layernorm = nn.RMSNorm(config.hidden_size, -1, config.rms_norm_eps, bias=False)
-        self.post_attention_layernorm = nn.RMSNorm(
-            config.hidden_size, -1, config.rms_norm_eps, bias=False
-        )
-
-        def _set_tp():
-            def _set(layer, hint):
-                layer.attrs["shard_strategy"] = hint
-
-            hd = config.head_dim
-            q = self.self_attn.num_heads * hd
-            k = self.self_attn.num_heads * hd
-            v = self.self_attn.num_heads * hd
-            i = self.mlp.intermediate_size
-            _set(
-                self.self_attn.wqkv_pack.weight,
-                tp.ShardSingleDim("_shard_qkv_weight", dim=0, segs=[q, k, v]),
-            )
-            if config.bias:
-                _set(
-                    self.self_attn.wqkv_pack.bias,
-                    tp.ShardSingleDim("_shard_qkv_bias", dim=0, segs=[q, k, v]),
-                )
-            _set(self.self_attn.o_proj.weight, tp.ShardSingleDim("_shard_o_weight", dim=1))
-            if config.bias:
-                _set(self.self_attn.o_proj.bias, tp.ShardSingleDim("_shard_o_bias", dim=0))
-            _set(
-                self.mlp.gate_up_proj.weight,
-                tp.ShardSingleDim("_shard_mlp_gate_up", segs=[i, i], dim=0),
-            )
-            _set(self.mlp.down_proj.weight, tp.ShardSingleDim("_shard_mlp_down_proj", dim=1))
-
-        self.tensor_parallel_shards = config.tensor_parallel_shards
-        _set_tp()
+        self.input_layernorm = nn.LayerNorm(config.hidden_size, config.norm_epsilon)
+        self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, config.norm_epsilon)
 
     def forward(self, hidden_states: Tensor, paged_kv_cache: PagedKVCache, layer_id: int):
-        out = self.self_attn(self.input_layernorm(hidden_states), paged_kv_cache, layer_id)
-        hidden_states = self._apply_residual(out, residual=hidden_states)
-        out = self.mlp(self.post_attention_layernorm(hidden_states))
-        hidden_states = self._apply_residual(out, residual=hidden_states)
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(hidden_states, paged_kv_cache, layer_id)
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
         return hidden_states
-
-    def _apply_residual(self, out, residual):
-        if self.tensor_parallel_shards > 1:
-            return op.ccl_allreduce(out, "sum") + residual
-        return out + residual
 
 
 class Starcoder2Model(nn.Module):
@@ -191,7 +164,7 @@ class Starcoder2Model(nn.Module):
         self.layers = nn.ModuleList(
             [Starcoder2DecoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
-        self.norm = nn.RMSNorm(config.hidden_size, -1, config.rms_norm_eps, bias=False)
+        self.norm = nn.LayerNorm(config.hidden_size, config.norm_epsilon)
 
     def forward(self, inputs: Tensor, paged_kv_cache: PagedKVCache):
         hidden_states = inputs
@@ -237,8 +210,6 @@ class Starcoder2ForCausalLM(nn.Module):  # pylint: disable=too-many-instance-att
         return logits
 
     def embed(self, input_ids: Tensor):
-        if self.tensor_parallel_shards > 1:
-            input_ids = op.ccl_broadcast_from_worker0(input_ids)
         return self.model.embed_tokens(input_ids)
 
     def prefill(self, input_embed: Tensor, paged_kv_cache: PagedKVCache):
